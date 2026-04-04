@@ -59,6 +59,7 @@ const SENTENCE_PATTERN = /[^.!?\n]+[.!?]+(?:\s+|$)|[^.!?\n]+$/g;
 const SHOW_DEBUG_UI = window.top === window.self;
 const CALIBRATION_MSG_TYPE = '__play_books_gaze_calibration_click__';
 const CALIBRATION_RESET_MSG_TYPE = '__play_books_gaze_calibration_reset__';
+const GAZE_POINT_MSG_TYPE = '__play_books_gaze_point__';
 
 let sentences: SentenceRange[] = [];
 let refreshTimer: number | null = null;
@@ -213,6 +214,24 @@ async function startGazeHighlighter() {
     return { x: topX, y: topY };
   };
 
+  const toLocalViewportPoint = (x: number, y: number): WebGazerPoint => {
+    let localX = x;
+    let localY = y;
+
+    try {
+      const frame = window.frameElement as HTMLElement | null;
+      if (frame) {
+        const rect = frame.getBoundingClientRect();
+        localX -= rect.left;
+        localY -= rect.top;
+      }
+    } catch {
+      // Cross-origin iframe access can fail; fall back to shared viewport coordinates.
+    }
+
+    return { x: localX, y: localY };
+  };
+
   const handleResetShortcut = (event: KeyboardEvent) => {
     if (!event.shiftKey || (event.key !== 'R' && event.key !== 'r')) {
       return;
@@ -266,6 +285,21 @@ async function startGazeHighlighter() {
   );
 
   if (!isTopFrame) {
+    window.addEventListener('message', (event: MessageEvent) => {
+      const data = event.data as { type?: string; x?: number; y?: number };
+      if (data?.type !== GAZE_POINT_MSG_TYPE) {
+        return;
+      }
+      if (typeof data.x !== 'number' || typeof data.y !== 'number') {
+        return;
+      }
+
+      const localPoint = toLocalViewportPoint(data.x, data.y);
+      lastPredictionAt = Date.now();
+      updateDebugCursor(Math.round(localPoint.x), Math.round(localPoint.y), 'gaze');
+      highlightSentenceAtPoint(localPoint.x, localPoint.y);
+    });
+
     updateDebugHud('Iframe mode\nmouse fallback active');
     return;
   }
@@ -342,7 +376,8 @@ async function startGazeHighlighter() {
     if (!point) {
       maybeEnableAssistMode();
 
-      if (import.meta.env.DEV && latestMousePoint) {
+      const shouldUseMouseFallback = Date.now() - lastPredictionAt > GAZE_STALE_MS;
+      if (import.meta.env.DEV && latestMousePoint && shouldUseMouseFallback) {
         processPoint(latestMousePoint, 'mouse');
         return;
       }
@@ -419,7 +454,28 @@ function processPoint(point: WebGazerPoint, source: 'gaze' | 'mouse') {
   updateDebugHud(`${sourceLabel}\nx: ${roundedX} y: ${roundedY}`);
   updateDebugCursor(roundedX, roundedY, source);
 
-  const sentence = findSentenceAtPoint(point.x, point.y);
+  if (source === 'gaze' && window.top === window.self) {
+    for (let i = 0; i < window.frames.length; i += 1) {
+      try {
+        window.frames[i]?.postMessage(
+          {
+            type: GAZE_POINT_MSG_TYPE,
+            x: point.x,
+            y: point.y,
+          },
+          '*',
+        );
+      } catch {
+        // Ignore frame messaging failures for detached or restricted frames.
+      }
+    }
+  }
+
+  highlightSentenceAtPoint(point.x, point.y);
+}
+
+function highlightSentenceAtPoint(x: number, y: number) {
+  const sentence = findSentenceAtPoint(x, y);
   if (!sentence || sentence.id === activeSentenceId) {
     return;
   }
@@ -526,6 +582,11 @@ function updateDebugCursor(x: number, y: number, source: 'gaze' | 'mouse') {
   debugCursor.style.left = `${x - 6}px`;
   debugCursor.style.top = `${y - 6}px`;
   debugCursor.style.background = source === 'gaze' ? '#ef4444' : '#f59e0b';
+
+  // Hover-highlight follows only gaze (red) cursor movement.
+  if (source === 'gaze') {
+    highlightSentenceAtPoint(x, y);
+  }
 
   if (cursorHideTimer) {
     window.clearTimeout(cursorHideTimer);
