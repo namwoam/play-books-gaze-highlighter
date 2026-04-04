@@ -55,11 +55,19 @@ const REQUIRED_CALIBRATION_CLICKS = 12;
 const PREDICTION_PROBE_MS = 300;
 const CALIBRATION_TO_ASSIST_MS = 5000;
 const CALIBRATION_HINT_COOLDOWN_MS = 1000;
+const GAZE_KALMAN_PROCESS_NOISE = 6;
+const GAZE_KALMAN_MEASUREMENT_NOISE = 90;
 const SENTENCE_PATTERN = /[^.!?\n]+[.!?]+(?:\s+|$)|[^.!?\n]+$/g;
 const SHOW_DEBUG_UI = window.top === window.self;
 const CALIBRATION_MSG_TYPE = '__play_books_gaze_calibration_click__';
 const CALIBRATION_RESET_MSG_TYPE = '__play_books_gaze_calibration_reset__';
 const GAZE_POINT_MSG_TYPE = '__play_books_gaze_point__';
+
+type AxisKalmanState = {
+  estimate: number;
+  covariance: number;
+  initialized: boolean;
+};
 
 let sentences: SentenceRange[] = [];
 let refreshTimer: number | null = null;
@@ -77,6 +85,52 @@ let calibrationCompletedAt = 0;
 let assistModeActive = false;
 let webGazerCrashGuardInstalled = false;
 let lastCalibrationHintAt = 0;
+let gazeKalmanX: AxisKalmanState = {
+  estimate: 0,
+  covariance: 1,
+  initialized: false,
+};
+let gazeKalmanY: AxisKalmanState = {
+  estimate: 0,
+  covariance: 1,
+  initialized: false,
+};
+
+function resetGazeKalman() {
+  gazeKalmanX = {
+    estimate: 0,
+    covariance: 1,
+    initialized: false,
+  };
+  gazeKalmanY = {
+    estimate: 0,
+    covariance: 1,
+    initialized: false,
+  };
+}
+
+function updateKalmanAxis(state: AxisKalmanState, measurement: number): number {
+  if (!state.initialized) {
+    state.estimate = measurement;
+    state.covariance = GAZE_KALMAN_MEASUREMENT_NOISE;
+    state.initialized = true;
+    return measurement;
+  }
+
+  state.covariance += GAZE_KALMAN_PROCESS_NOISE;
+  const kalmanGain = state.covariance / (state.covariance + GAZE_KALMAN_MEASUREMENT_NOISE);
+  state.estimate = state.estimate + kalmanGain * (measurement - state.estimate);
+  state.covariance = (1 - kalmanGain) * state.covariance;
+
+  return state.estimate;
+}
+
+function filterGazePoint(point: WebGazerPoint): WebGazerPoint {
+  return {
+    x: updateKalmanAxis(gazeKalmanX, point.x),
+    y: updateKalmanAxis(gazeKalmanY, point.y),
+  };
+}
 
 function isCalibrationComplete() {
   return calibrationClicks >= REQUIRED_CALIBRATION_CLICKS;
@@ -135,6 +189,7 @@ async function resetCalibration(clearModelData = false) {
   calibrationCompletedAt = 0;
   lastPredictionAt = 0;
   lastCalibrationHintAt = 0;
+  resetGazeKalman();
   disableAssistMode();
 
   if (clearModelData && activeWebGazer?.clearData) {
@@ -441,8 +496,10 @@ function processPoint(point: WebGazerPoint, source: 'gaze' | 'mouse') {
   }
   lastSampleAt = now;
 
-  const roundedX = Math.round(point.x);
-  const roundedY = Math.round(point.y);
+  const processedPoint = source === 'gaze' ? filterGazePoint(point) : point;
+
+  const roundedX = Math.round(processedPoint.x);
+  const roundedY = Math.round(processedPoint.y);
 
   console.info('[WebGazer] point', {
     source,
@@ -460,8 +517,8 @@ function processPoint(point: WebGazerPoint, source: 'gaze' | 'mouse') {
         window.frames[i]?.postMessage(
           {
             type: GAZE_POINT_MSG_TYPE,
-            x: point.x,
-            y: point.y,
+            x: processedPoint.x,
+            y: processedPoint.y,
           },
           '*',
         );
@@ -471,7 +528,7 @@ function processPoint(point: WebGazerPoint, source: 'gaze' | 'mouse') {
     }
   }
 
-  highlightSentenceAtPoint(point.x, point.y);
+  highlightSentenceAtPoint(processedPoint.x, processedPoint.y);
 }
 
 function highlightSentenceAtPoint(x: number, y: number) {
