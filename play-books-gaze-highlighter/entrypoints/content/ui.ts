@@ -1,4 +1,5 @@
 import {
+  ACTIVE_SENTENCE_CLASS,
   DEBUG_CURSOR_HIDE_MS,
   DEBUG_CURSOR_ID,
   DEBUG_HUD_ID,
@@ -34,6 +35,12 @@ export function createUiController(options: CreateUiOptions): UiController {
       ::highlight(${HIGHLIGHT_NAME}) {
         background: rgba(255, 230, 135, 0.85);
         border-radius: 6px;
+      }
+
+      .${ACTIVE_SENTENCE_CLASS} {
+        background: rgba(255, 230, 135, 0.85);
+        border-radius: 6px;
+        font-size: 1.20em;
       }
 
       #${OVERLAY_ID} {

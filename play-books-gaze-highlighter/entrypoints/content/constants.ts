@@ -1,4 +1,5 @@
 export const HIGHLIGHT_NAME = 'play-books-gaze-sentence';
+export const ACTIVE_SENTENCE_CLASS = 'play-books-gaze-active-sentence';
 export const STYLE_ID = 'play-books-gaze-style';
 export const OVERLAY_ID = 'play-books-gaze-overlay';
 export const DEBUG_HUD_ID = 'play-books-gaze-debug';

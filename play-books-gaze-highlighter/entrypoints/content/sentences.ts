@@ -1,4 +1,9 @@
-import { HIGHLIGHT_NAME, REFRESH_DEBOUNCE_MS, SENTENCE_PATTERN } from './constants';
+import {
+  ACTIVE_SENTENCE_CLASS,
+  HIGHLIGHT_NAME,
+  REFRESH_DEBOUNCE_MS,
+  SENTENCE_PATTERN,
+} from './constants';
 import type { SentenceRange } from './types';
 
 type SentenceControllerOptions = {
@@ -15,6 +20,31 @@ export function createSentenceController(options: SentenceControllerOptions): Se
   let sentences: SentenceRange[] = [];
   let refreshTimer: number | null = null;
   let activeSentenceId: number | null = null;
+  let activeSentenceElement: HTMLSpanElement | null = null;
+
+  const unwrapActiveSentence = () => {
+    if (!activeSentenceElement || !activeSentenceElement.parentNode) {
+      activeSentenceElement = null;
+      return;
+    }
+
+    const parent = activeSentenceElement.parentNode;
+    while (activeSentenceElement.firstChild) {
+      parent.insertBefore(activeSentenceElement.firstChild, activeSentenceElement);
+    }
+    parent.removeChild(activeSentenceElement);
+    activeSentenceElement = null;
+  };
+
+  const clearNativeHighlight = () => {
+    const cssWithHighlights = CSS as unknown as {
+      highlights?: {
+        delete?: (name: string) => void;
+      };
+    };
+
+    cssWithHighlights.highlights?.delete?.(HIGHLIGHT_NAME);
+  };
 
   const scheduleSentenceRefresh = () => {
     if (refreshTimer) {
@@ -113,19 +143,31 @@ export function createSentenceController(options: SentenceControllerOptions): Se
   };
 
   const applyHighlight = (range: Range) => {
-    const cssWithHighlights = CSS as unknown as {
-      highlights?: {
-        set: (name: string, highlight: Highlight) => void;
+    unwrapActiveSentence();
+    clearNativeHighlight();
+
+    try {
+      const wrapper = document.createElement('span');
+      wrapper.className = ACTIVE_SENTENCE_CLASS;
+      range.surroundContents(wrapper);
+      activeSentenceElement = wrapper;
+      options.setOverlayRect(wrapper.getBoundingClientRect());
+      return;
+    } catch {
+      const cssWithHighlights = CSS as unknown as {
+        highlights?: {
+          set?: (name: string, highlight: Highlight) => void;
+        };
       };
-    };
 
-    if (cssWithHighlights.highlights) {
-      const highlight = new Highlight();
-      highlight.add(range);
-      cssWithHighlights.highlights.set(HIGHLIGHT_NAME, highlight);
+      if (cssWithHighlights.highlights?.set) {
+        const highlight = new Highlight();
+        highlight.add(range);
+        cssWithHighlights.highlights.set(HIGHLIGHT_NAME, highlight);
+      }
+
+      options.setOverlayRect(range.getBoundingClientRect());
     }
-
-    options.setOverlayRect(range.getBoundingClientRect());
   };
 
   const highlightSentenceAtPoint = (x: number, y: number) => {
