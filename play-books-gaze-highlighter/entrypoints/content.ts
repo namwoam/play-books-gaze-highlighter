@@ -30,10 +30,13 @@ type WebGazerLike = {
   saveDataAcrossSessions: (enabled: boolean) => WebGazerLike;
   setTracker: (name: string) => WebGazerLike;
   showVideoPreview: (show: boolean) => WebGazerLike;
+  showVideo: (show: boolean) => WebGazerLike;
   showPredictionPoints: (show: boolean) => WebGazerLike;
   showFaceOverlay: (show: boolean) => WebGazerLike;
   showFaceFeedbackBox: (show: boolean) => WebGazerLike;
   setRegression: (name: string) => WebGazerLike;
+  getCurrentPrediction?: () => Promise<WebGazerPoint | null> | WebGazerPoint | null;
+  clearData?: () => Promise<void>;
 };
 
 const HIGHLIGHT_NAME = 'play-books-gaze-sentence';
@@ -43,7 +46,15 @@ const DEBUG_HUD_ID = 'play-books-gaze-debug';
 const DEBUG_CURSOR_ID = 'play-books-gaze-cursor';
 const REFRESH_DEBOUNCE_MS = 300;
 const GAZE_SAMPLE_MS = 120;
+const GAZE_STALE_MS = 1200;
+const DEBUG_CURSOR_HIDE_MS = 250;
+const REQUIRED_CALIBRATION_CLICKS = 12;
+const PREDICTION_PROBE_MS = 300;
+const CALIBRATION_TO_ASSIST_MS = 5000;
 const SENTENCE_PATTERN = /[^.!?\n]+[.!?]+(?:\s+|$)|[^.!?\n]+$/g;
+const SHOW_DEBUG_UI = window.top === window.self;
+const CALIBRATION_MSG_TYPE = '__play_books_gaze_calibration_click__';
+const CALIBRATION_RESET_MSG_TYPE = '__play_books_gaze_calibration_reset__';
 
 let sentences: SentenceRange[] = [];
 let refreshTimer: number | null = null;
@@ -52,6 +63,28 @@ let activeSentenceId: number | null = null;
 let lastSampleAt = 0;
 let lastPredictionAt = 0;
 let latestMousePoint: WebGazerPoint | null = null;
+let cursorHideTimer: number | null = null;
+let activeWebGazer: WebGazerLike | null = null;
+const pendingCalibrationPoints: WebGazerPoint[] = [];
+let calibrationClicks = 0;
+let predictionProbeTimer: number | null = null;
+let calibrationCompletedAt = 0;
+let assistModeActive = false;
+
+async function resetCalibration(clearModelData = false) {
+  calibrationClicks = 0;
+  calibrationCompletedAt = 0;
+  lastPredictionAt = 0;
+  disableAssistMode();
+
+  if (clearModelData && activeWebGazer?.clearData) {
+    await activeWebGazer.clearData();
+  }
+
+  updateDebugHud(
+    `Calibration reset\nClick ${REQUIRED_CALIBRATION_CLICKS} points across the page.\n(Press Shift+R to reset anytime)`,
+  );
+}
 
 async function startGazeHighlighter() {
   console.log('[WebGazer] content script started');
@@ -60,18 +93,143 @@ async function startGazeHighlighter() {
   collectSentences();
   watchDomForRefresh();
 
-  if (import.meta.env.DEV) {
-    window.addEventListener('mousemove', (event) => {
-      latestMousePoint = { x: event.clientX, y: event.clientY };
-      processPoint(latestMousePoint, 'mouse');
-    });
-  }
-
   const isTopFrame = window.top === window.self;
+
+  const handleMousePoint = (event: MouseEvent) => {
+    latestMousePoint = { x: event.clientX, y: event.clientY };
+
+    const shouldUseMouseFallback =
+      !isTopFrame || Date.now() - lastPredictionAt > GAZE_STALE_MS;
+    if (!shouldUseMouseFallback) {
+      return;
+    }
+
+    updateDebugCursor(Math.round(event.clientX), Math.round(event.clientY), 'mouse');
+    processPoint(latestMousePoint, 'mouse');
+  };
+
+  const handleCalibrationPoint = (x: number, y: number, source: 'top' | 'iframe') => {
+    calibrationClicks += 1;
+    const progress = Math.min(calibrationClicks, REQUIRED_CALIBRATION_CLICKS);
+    const progressLine = `Calibration: ${progress}/${REQUIRED_CALIBRATION_CLICKS}`;
+
+    if (!activeWebGazer) {
+      pendingCalibrationPoints.push({ x, y });
+      updateDebugHud(
+        `${progressLine}\nCalibration queued (${source})\nx: ${Math.round(x)} y: ${Math.round(y)}`,
+      );
+      return;
+    }
+
+    activeWebGazer.recordScreenPosition(x, y, 'click');
+
+    if (calibrationClicks >= REQUIRED_CALIBRATION_CLICKS) {
+      calibrationCompletedAt = Date.now();
+      updateDebugHud(
+        `${progressLine}\nCalibration clicks complete.\nWaiting for first gaze prediction...`,
+      );
+    } else {
+      updateDebugHud(
+        `${progressLine}\nCalibration click captured (${source})\nx: ${Math.round(x)} y: ${Math.round(y)}`,
+      );
+    }
+  };
+
+  const toTopViewportPoint = (x: number, y: number): WebGazerPoint => {
+    let topX = x;
+    let topY = y;
+
+    try {
+      const frame = window.frameElement as HTMLElement | null;
+      if (frame) {
+        const rect = frame.getBoundingClientRect();
+        topX += rect.left;
+        topY += rect.top;
+      }
+    } catch {
+      // Cross-origin iframe access can fail; fall back to local coordinates.
+    }
+
+    return { x: topX, y: topY };
+  };
+
+  const handleResetShortcut = (event: KeyboardEvent) => {
+    if (!event.shiftKey || (event.key !== 'R' && event.key !== 'r')) {
+      return;
+    }
+
+    event.preventDefault();
+    event.stopPropagation();
+
+    if (isTopFrame) {
+      void resetCalibration(true);
+      return;
+    }
+
+    window.top?.postMessage({ type: CALIBRATION_RESET_MSG_TYPE }, '*');
+  };
+
+  // Listen on both window and document capture phase so iframe-rendered readers
+  // still update the debug cursor consistently.
+  window.addEventListener('mousemove', handleMousePoint, { capture: true });
+  document.addEventListener('mousemove', handleMousePoint, { capture: true });
+  window.addEventListener('keydown', handleResetShortcut, { capture: true });
+  document.addEventListener('keydown', handleResetShortcut, { capture: true });
+  window.addEventListener('keyup', handleResetShortcut, { capture: true });
+  document.addEventListener('keyup', handleResetShortcut, { capture: true });
+  window.addEventListener(
+    'click',
+    (event) => {
+      const clickPoint = toTopViewportPoint(event.clientX, event.clientY);
+
+      if (isTopFrame) {
+        handleCalibrationPoint(clickPoint.x, clickPoint.y, 'top');
+      } else {
+        window.top?.postMessage(
+          {
+            type: CALIBRATION_MSG_TYPE,
+            x: clickPoint.x,
+            y: clickPoint.y,
+          },
+          '*',
+        );
+      }
+
+      const shouldUseMouseFallback =
+        !isTopFrame || Date.now() - lastPredictionAt > GAZE_STALE_MS;
+      if (!shouldUseMouseFallback) {
+        return;
+      }
+      updateDebugCursor(Math.round(event.clientX), Math.round(event.clientY), 'mouse');
+    },
+    { capture: true },
+  );
+
   if (!isTopFrame) {
     updateDebugHud('Iframe mode\nmouse fallback active');
     return;
   }
+
+  window.addEventListener('message', (event: MessageEvent) => {
+    const data = event.data as { type?: string; x?: number; y?: number };
+    if (!data?.type) {
+      return;
+    }
+
+    if (data.type === CALIBRATION_RESET_MSG_TYPE) {
+      void resetCalibration(true);
+      return;
+    }
+
+    if (data.type !== CALIBRATION_MSG_TYPE) {
+      return;
+    }
+    if (typeof data.x !== 'number' || typeof data.y !== 'number') {
+      return;
+    }
+
+    handleCalibrationPoint(data.x, data.y, 'iframe');
+  });
 
   const webgazer = await initWebGazer();
   if (!webgazer) {
@@ -79,17 +237,45 @@ async function startGazeHighlighter() {
     return;
   }
 
+  activeWebGazer = webgazer;
+  await resetCalibration(true);
+
+  if (pendingCalibrationPoints.length > 0) {
+    for (const point of pendingCalibrationPoints.splice(0)) {
+      activeWebGazer.recordScreenPosition(point.x, point.y, 'click');
+    }
+    updateDebugHud('WebGazer ready\nqueued calibration points applied');
+  }
+
   updateDebugHud('WebGazer ready, waiting for gaze data...');
 
-  window.addEventListener('click', (event) => {
-    webgazer.recordScreenPosition(event.clientX, event.clientY, 'click');
-    updateDebugHud(
-      `Calibration click captured\nx: ${Math.round(event.clientX)} y: ${Math.round(event.clientY)}`,
-    );
-  });
+  if (predictionProbeTimer) {
+    window.clearInterval(predictionProbeTimer);
+  }
+  predictionProbeTimer = window.setInterval(async () => {
+    maybeEnableAssistMode();
+
+    if (!activeWebGazer?.getCurrentPrediction) {
+      return;
+    }
+
+    try {
+      const prediction = await Promise.resolve(activeWebGazer.getCurrentPrediction());
+      if (!prediction) {
+        return;
+      }
+      lastPredictionAt = Date.now();
+      disableAssistMode();
+      processPoint(prediction, 'gaze');
+    } catch {
+      // Ignore probe errors, listener path remains active.
+    }
+  }, PREDICTION_PROBE_MS);
 
   webgazer.setGazeListener((point) => {
     if (!point) {
+      maybeEnableAssistMode();
+
       if (import.meta.env.DEV && latestMousePoint) {
         processPoint(latestMousePoint, 'mouse');
         return;
@@ -104,8 +290,42 @@ async function startGazeHighlighter() {
     }
 
     lastPredictionAt = Date.now();
+    disableAssistMode();
     processPoint(point, 'gaze');
   });
+}
+
+function maybeEnableAssistMode() {
+  if (
+    calibrationCompletedAt <= 0 ||
+    assistModeActive ||
+    Date.now() - calibrationCompletedAt <= CALIBRATION_TO_ASSIST_MS
+  ) {
+    return;
+  }
+
+  assistModeActive = true;
+  activeWebGazer
+    ?.showVideo(true)
+    .showVideoPreview(true)
+    .showFaceOverlay(true)
+    .showFaceFeedbackBox(true);
+  updateDebugHud(
+    'No gaze prediction after calibration.\nCamera assist enabled - align face in box.',
+  );
+}
+
+function disableAssistMode() {
+  if (!assistModeActive) {
+    return;
+  }
+
+  assistModeActive = false;
+  activeWebGazer
+    ?.showVideo(false)
+    .showVideoPreview(false)
+    .showFaceOverlay(false)
+    .showFaceFeedbackBox(false);
 }
 
 function processPoint(point: WebGazerPoint, source: 'gaze' | 'mouse') {
@@ -181,16 +401,16 @@ function installStyle() {
       position: fixed;
       width: 12px;
       height: 12px;
-      margin-left: -6px;
-      margin-top: -6px;
+      left: -9999px;
+      top: -9999px;
+      display: none;
       border-radius: 999px;
       border: 2px solid #fff;
       background: #ef4444;
       z-index: 2147483647;
       pointer-events: none;
       box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.45);
-      transform: translate(-9999px, -9999px);
-      transition: transform 70ms linear, background 120ms ease;
+      transition: left 70ms linear, top 70ms linear, background 120ms ease;
     }
   `;
   document.head.append(style);
@@ -199,17 +419,25 @@ function installStyle() {
   overlay.id = OVERLAY_ID;
   document.body.append(overlay);
 
+  const debugCursor = document.createElement('div');
+  debugCursor.id = DEBUG_CURSOR_ID;
+  document.body.append(debugCursor);
+
+  if (!SHOW_DEBUG_UI) {
+    return;
+  }
+
   const debugHud = document.createElement('div');
   debugHud.id = DEBUG_HUD_ID;
   debugHud.textContent = 'Initializing...';
   document.body.append(debugHud);
-
-  const debugCursor = document.createElement('div');
-  debugCursor.id = DEBUG_CURSOR_ID;
-  document.body.append(debugCursor);
 }
 
 function updateDebugHud(message: string) {
+  if (!SHOW_DEBUG_UI) {
+    return;
+  }
+
   const debugHud = document.getElementById(DEBUG_HUD_ID);
   if (!debugHud) {
     return;
@@ -223,8 +451,17 @@ function updateDebugCursor(x: number, y: number, source: 'gaze' | 'mouse') {
     return;
   }
 
-  debugCursor.style.transform = `translate(${x}px, ${y}px)`;
-  debugCursor.style.background = source === 'gaze' ? '#22c55e' : '#ef4444';
+  debugCursor.style.display = 'block';
+  debugCursor.style.left = `${x - 6}px`;
+  debugCursor.style.top = `${y - 6}px`;
+  debugCursor.style.background = source === 'gaze' ? '#ef4444' : '#f59e0b';
+
+  if (cursorHideTimer) {
+    window.clearTimeout(cursorHideTimer);
+  }
+  cursorHideTimer = window.setTimeout(() => {
+    debugCursor.style.display = 'none';
+  }, DEBUG_CURSOR_HIDE_MS);
 }
 
 async function initWebGazer(): Promise<WebGazerLike | null> {
@@ -239,7 +476,7 @@ async function initWebGazer(): Promise<WebGazerLike | null> {
     const maybeWebGazer = (module.default ?? module) as WebGazerLike;
 
     maybeWebGazer
-      .saveDataAcrossSessions(true)
+      .saveDataAcrossSessions(false)
       .applyKalmanFilter(true)
       .setTracker('TFFacemesh');
 
