@@ -21,6 +21,13 @@ type WebGazerPoint = {
   y: number;
 };
 
+type FaceMeshPoint = [number, number, number?];
+
+type FaceTrackerLike = {
+  name?: string;
+  getPositions?: () => FaceMeshPoint[] | null;
+};
+
 type WebGazerLike = {
   setGazeListener: (
     listener: (data: WebGazerPoint | null, elapsedTime: number) => void,
@@ -37,7 +44,7 @@ type WebGazerLike = {
   showFaceOverlay: (show: boolean) => WebGazerLike;
   showFaceFeedbackBox: (show: boolean) => WebGazerLike;
   setRegression: (name: string) => WebGazerLike;
-  getTracker?: () => { name?: string };
+  getTracker?: () => FaceTrackerLike;
   getCurrentPrediction?: () => Promise<WebGazerPoint | null> | WebGazerPoint | null;
   clearData?: () => Promise<void>;
 };
@@ -57,11 +64,18 @@ const CALIBRATION_TO_ASSIST_MS = 5000;
 const CALIBRATION_HINT_COOLDOWN_MS = 1000;
 const GAZE_KALMAN_PROCESS_NOISE = 6;
 const GAZE_KALMAN_MEASUREMENT_NOISE = 90;
+const PAGE_TURN_DEBOUNCE_MS = 1200;
+const HEAD_TILT_NEUTRAL_DEG = 10;
+const HEAD_TILT_SWING_DEG = 35;
+const HEAD_TILT_SWING_WINDOW_MS = 700;
+const FACEMESH_RIGHT_EYE_OUTER_INDEX = 33;
+const FACEMESH_LEFT_EYE_OUTER_INDEX = 263;
 const SENTENCE_PATTERN = /[^.!?\n]+[.!?]+(?:\s+|$)|[^.!?\n]+$/g;
 const SHOW_DEBUG_UI = window.top === window.self;
 const CALIBRATION_MSG_TYPE = '__play_books_gaze_calibration_click__';
 const CALIBRATION_RESET_MSG_TYPE = '__play_books_gaze_calibration_reset__';
 const GAZE_POINT_MSG_TYPE = '__play_books_gaze_point__';
+const PAGE_TURN_MSG_TYPE = '__play_books_gaze_page_turn__';
 
 type AxisKalmanState = {
   estimate: number;
@@ -95,6 +109,207 @@ let gazeKalmanY: AxisKalmanState = {
   covariance: 1,
   initialized: false,
 };
+let lastPageTurnAt = 0;
+let lastNeutralTiltAt = 0;
+
+function toDegrees(radians: number) {
+  return (radians * 180) / Math.PI;
+}
+
+function emitPageTurnKey(direction: 'next' | 'prev', target: EventTarget) {
+  const key = direction === 'next' ? 'ArrowRight' : 'ArrowLeft';
+  const code = direction === 'next' ? 'ArrowRight' : 'ArrowLeft';
+
+  target.dispatchEvent(
+    new KeyboardEvent('keydown', {
+      key,
+      code,
+      bubbles: true,
+      cancelable: true,
+    }),
+  );
+  target.dispatchEvent(
+    new KeyboardEvent('keyup', {
+      key,
+      code,
+      bubbles: true,
+      cancelable: true,
+    }),
+  );
+}
+
+function tryPageTurnByKey(direction: 'next' | 'prev') {
+  const focusTarget = document.body ?? document.documentElement;
+  if (focusTarget instanceof HTMLElement) {
+    focusTarget.focus();
+  }
+
+  const active = document.activeElement;
+  if (active instanceof HTMLInputElement || active instanceof HTMLTextAreaElement) {
+    return false;
+  }
+
+  if (active instanceof HTMLElement && active.isContentEditable) {
+    return false;
+  }
+
+  const targets: EventTarget[] = [];
+  if (active) {
+    targets.push(active);
+  }
+  targets.push(document);
+  targets.push(window);
+
+  for (const target of targets) {
+    emitPageTurnKey(direction, target);
+  }
+
+  return true;
+}
+
+function clickPageButton(direction: 'next' | 'prev') {
+  const selector =
+    direction === 'next'
+      ? [
+          'button[aria-label*="next" i]',
+          '[role="button"][aria-label*="next" i]',
+          'button[title*="next" i]',
+          '[role="button"][title*="next" i]',
+        ]
+      : [
+          'button[aria-label*="prev" i]',
+          'button[aria-label*="previous" i]',
+          '[role="button"][aria-label*="prev" i]',
+          '[role="button"][aria-label*="previous" i]',
+          'button[title*="prev" i]',
+          'button[title*="previous" i]',
+          '[role="button"][title*="prev" i]',
+          '[role="button"][title*="previous" i]',
+        ];
+
+  for (const query of selector) {
+    const element = document.querySelector<HTMLElement>(query);
+    if (!element) {
+      continue;
+    }
+
+    element.click();
+    return true;
+  }
+
+  return false;
+}
+
+function attemptPageTurnLocal(direction: 'next' | 'prev') {
+  const usedButton = clickPageButton(direction);
+  const usedKeyboard = tryPageTurnByKey(direction);
+  return usedButton || usedKeyboard;
+}
+
+function triggerPageTurn(direction: 'next' | 'prev') {
+  const now = Date.now();
+  if (now - lastPageTurnAt < PAGE_TURN_DEBOUNCE_MS) {
+    return;
+  }
+
+  let turned = attemptPageTurnLocal(direction);
+
+  if (window.top === window.self) {
+    for (let i = 0; i < window.frames.length; i += 1) {
+      try {
+        window.frames[i]?.postMessage(
+          {
+            type: PAGE_TURN_MSG_TYPE,
+            direction,
+          },
+          '*',
+        );
+      } catch {
+        // Ignore frame messaging failures for detached or restricted frames.
+      }
+    }
+  }
+
+  // Treat any attempt as consumed so repeated extreme poses don't spam commands.
+  if (!turned && import.meta.env.DEV) {
+    console.info('[WebGazer] page turn command dispatched but no local control consumed it', {
+      direction,
+    });
+  }
+
+  lastPageTurnAt = now;
+}
+
+function getHeadRollDegrees(): number | null {
+  const landmarks = activeWebGazer?.getTracker?.()?.getPositions?.();
+  if (!landmarks || landmarks.length <= FACEMESH_LEFT_EYE_OUTER_INDEX) {
+    return null;
+  }
+
+  const eyeA = landmarks[FACEMESH_RIGHT_EYE_OUTER_INDEX];
+  const eyeB = landmarks[FACEMESH_LEFT_EYE_OUTER_INDEX];
+  if (!eyeA || !eyeB) {
+    return null;
+  }
+
+  const leftEye = eyeA[0] <= eyeB[0] ? eyeA : eyeB;
+  const rightEye = eyeA[0] <= eyeB[0] ? eyeB : eyeA;
+
+  const dx = rightEye[0] - leftEye[0];
+  const dy = rightEye[1] - leftEye[1];
+  if (Math.abs(dx) < 0.001) {
+    return null;
+  }
+
+  return toDegrees(Math.atan2(dy, dx));
+}
+
+function handleHeadTiltPageTurn(): number | null {
+  const roll = getHeadRollDegrees();
+  if (roll === null) {
+    return null;
+  }
+
+  const now = Date.now();
+  const absRoll = Math.abs(roll);
+  if (absRoll <= HEAD_TILT_NEUTRAL_DEG) {
+    lastNeutralTiltAt = now;
+    return roll;
+  }
+
+  if (lastNeutralTiltAt <= 0) {
+    return roll;
+  }
+
+  if (now - lastNeutralTiltAt > HEAD_TILT_SWING_WINDOW_MS) {
+    return roll;
+  }
+
+  if (roll <= -HEAD_TILT_SWING_DEG) {
+    console.info('[WebGazer] extreme tilt detected', {
+      direction: 'negative',
+      tiltDeg: Number(roll.toFixed(1)),
+      transitionMs: now - lastNeutralTiltAt,
+      action: 'next',
+    });
+    triggerPageTurn('next');
+    lastNeutralTiltAt = 0;
+    return roll;
+  }
+
+  if (roll >= HEAD_TILT_SWING_DEG) {
+    console.info('[WebGazer] extreme tilt detected', {
+      direction: 'positive',
+      tiltDeg: Number(roll.toFixed(1)),
+      transitionMs: now - lastNeutralTiltAt,
+      action: 'prev',
+    });
+    triggerPageTurn('prev');
+    lastNeutralTiltAt = 0;
+  }
+
+  return roll;
+}
 
 function resetGazeKalman() {
   gazeKalmanX = {
@@ -341,7 +556,19 @@ async function startGazeHighlighter() {
 
   if (!isTopFrame) {
     window.addEventListener('message', (event: MessageEvent) => {
-      const data = event.data as { type?: string; x?: number; y?: number };
+      const data = event.data as {
+        type?: string;
+        x?: number;
+        y?: number;
+        direction?: 'next' | 'prev';
+      };
+      if (data?.type === PAGE_TURN_MSG_TYPE) {
+        if (data.direction === 'next' || data.direction === 'prev') {
+          attemptPageTurnLocal(data.direction);
+        }
+        return;
+      }
+
       if (data?.type !== GAZE_POINT_MSG_TYPE) {
         return;
       }
@@ -507,8 +734,15 @@ function processPoint(point: WebGazerPoint, source: 'gaze' | 'mouse') {
     y: roundedY,
   });
 
+  let tiltLabel = '';
+  if (source === 'gaze' && window.top === window.self) {
+    const tiltDegrees = handleHeadTiltPageTurn();
+    tiltLabel =
+      tiltDegrees === null ? '\ntilt: unavailable' : `\ntilt: ${tiltDegrees.toFixed(1)} deg`;
+  }
+
   const sourceLabel = source === 'gaze' ? 'gaze' : 'mouse fallback';
-  updateDebugHud(`${sourceLabel}\nx: ${roundedX} y: ${roundedY}`);
+  updateDebugHud(`${sourceLabel}\nx: ${roundedX} y: ${roundedY}${tiltLabel}`);
   updateDebugCursor(roundedX, roundedY, source);
 
   if (source === 'gaze' && window.top === window.self) {
