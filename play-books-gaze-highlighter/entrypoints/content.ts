@@ -1,12 +1,8 @@
 export default defineContentScript({
-  matches: ['https://play.google.com/books/reader*'],
+  matches: ['https://play.google.com/*', 'https://books.googleusercontent.com/*'],
   allFrames: true,
   world: 'MAIN',
   main() {
-    if (window.top !== window.self) {
-      return;
-    }
-
     void startGazeHighlighter();
   },
 });
@@ -28,6 +24,11 @@ type WebGazerLike = {
     listener: (data: WebGazerPoint | null, elapsedTime: number) => void,
   ) => WebGazerLike;
   begin: () => Promise<WebGazerLike>;
+  addMouseEventListeners: () => WebGazerLike;
+  recordScreenPosition: (x: number, y: number, eventType?: string) => WebGazerLike;
+  applyKalmanFilter: (enabled: boolean) => WebGazerLike;
+  saveDataAcrossSessions: (enabled: boolean) => WebGazerLike;
+  setTracker: (name: string) => WebGazerLike;
   showVideoPreview: (show: boolean) => WebGazerLike;
   showPredictionPoints: (show: boolean) => WebGazerLike;
   showFaceOverlay: (show: boolean) => WebGazerLike;
@@ -39,6 +40,7 @@ const HIGHLIGHT_NAME = 'play-books-gaze-sentence';
 const STYLE_ID = 'play-books-gaze-style';
 const OVERLAY_ID = 'play-books-gaze-overlay';
 const DEBUG_HUD_ID = 'play-books-gaze-debug';
+const DEBUG_CURSOR_ID = 'play-books-gaze-cursor';
 const REFRESH_DEBOUNCE_MS = 300;
 const GAZE_SAMPLE_MS = 120;
 const SENTENCE_PATTERN = /[^.!?\n]+[.!?]+(?:\s+|$)|[^.!?\n]+$/g;
@@ -58,19 +60,33 @@ async function startGazeHighlighter() {
   collectSentences();
   watchDomForRefresh();
 
-  const webgazer = await initWebGazer();
-  if (!webgazer) {
-    updateDebugHud('WebGazer init failed');
-    return;
-  }
-
   if (import.meta.env.DEV) {
     window.addEventListener('mousemove', (event) => {
       latestMousePoint = { x: event.clientX, y: event.clientY };
+      processPoint(latestMousePoint, 'mouse');
     });
   }
 
+  const isTopFrame = window.top === window.self;
+  if (!isTopFrame) {
+    updateDebugHud('Iframe mode\nmouse fallback active');
+    return;
+  }
+
+  const webgazer = await initWebGazer();
+  if (!webgazer) {
+    updateDebugHud('WebGazer init failed\nmouse fallback active');
+    return;
+  }
+
   updateDebugHud('WebGazer ready, waiting for gaze data...');
+
+  window.addEventListener('click', (event) => {
+    webgazer.recordScreenPosition(event.clientX, event.clientY, 'click');
+    updateDebugHud(
+      `Calibration click captured\nx: ${Math.round(event.clientX)} y: ${Math.round(event.clientY)}`,
+    );
+  });
 
   webgazer.setGazeListener((point) => {
     if (!point) {
@@ -110,6 +126,7 @@ function processPoint(point: WebGazerPoint, source: 'gaze' | 'mouse') {
 
   const sourceLabel = source === 'gaze' ? 'gaze' : 'mouse fallback';
   updateDebugHud(`${sourceLabel}\nx: ${roundedX} y: ${roundedY}`);
+  updateDebugCursor(roundedX, roundedY, source);
 
   const sentence = findSentenceAtPoint(point.x, point.y);
   if (!sentence || sentence.id === activeSentenceId) {
@@ -159,6 +176,22 @@ function installStyle() {
       max-width: 280px;
       white-space: pre-wrap;
     }
+
+    #${DEBUG_CURSOR_ID} {
+      position: fixed;
+      width: 12px;
+      height: 12px;
+      margin-left: -6px;
+      margin-top: -6px;
+      border-radius: 999px;
+      border: 2px solid #fff;
+      background: #ef4444;
+      z-index: 2147483647;
+      pointer-events: none;
+      box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.45);
+      transform: translate(-9999px, -9999px);
+      transition: transform 70ms linear, background 120ms ease;
+    }
   `;
   document.head.append(style);
 
@@ -170,6 +203,10 @@ function installStyle() {
   debugHud.id = DEBUG_HUD_ID;
   debugHud.textContent = 'Initializing...';
   document.body.append(debugHud);
+
+  const debugCursor = document.createElement('div');
+  debugCursor.id = DEBUG_CURSOR_ID;
+  document.body.append(debugCursor);
 }
 
 function updateDebugHud(message: string) {
@@ -178,6 +215,16 @@ function updateDebugHud(message: string) {
     return;
   }
   debugHud.textContent = `[WebGazer]\n${message}`;
+}
+
+function updateDebugCursor(x: number, y: number, source: 'gaze' | 'mouse') {
+  const debugCursor = document.getElementById(DEBUG_CURSOR_ID);
+  if (!debugCursor) {
+    return;
+  }
+
+  debugCursor.style.transform = `translate(${x}px, ${y}px)`;
+  debugCursor.style.background = source === 'gaze' ? '#22c55e' : '#ef4444';
 }
 
 async function initWebGazer(): Promise<WebGazerLike | null> {
@@ -191,15 +238,20 @@ async function initWebGazer(): Promise<WebGazerLike | null> {
     const module = await import('webgazer');
     const maybeWebGazer = (module.default ?? module) as WebGazerLike;
 
-    const showDebugAids = import.meta.env.DEV;
+    maybeWebGazer
+      .saveDataAcrossSessions(true)
+      .applyKalmanFilter(true)
+      .setTracker('TFFacemesh');
 
     const instance = await maybeWebGazer
       .setRegression('ridge')
-      .showVideoPreview(showDebugAids)
+      .showVideoPreview(false)
       .showPredictionPoints(false)
       .showFaceOverlay(false)
       .showFaceFeedbackBox(false)
       .begin();
+
+    instance.addMouseEventListeners();
 
     console.log('[WebGazer] initialized');
 

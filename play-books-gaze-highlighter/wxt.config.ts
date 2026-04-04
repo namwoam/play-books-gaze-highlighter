@@ -7,6 +7,9 @@ export default defineConfig({
 		description:
 			'Auto-highlight Google Play Books sentences using WebGazer eye tracking.',
 		permissions: ['storage'],
-		host_permissions: ['https://play.google.com/*'],
+		host_permissions: [
+			'https://play.google.com/*',
+			'https://books.googleusercontent.com/*',
+		],
 	},
 });
