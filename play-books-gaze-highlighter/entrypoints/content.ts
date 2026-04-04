@@ -416,22 +416,94 @@ async function resetCalibration(clearModelData = false) {
   );
 }
 
-async function startGazeHighlighter() {
-  console.log('[WebGazer] content script started');
-  installWebGazerCrashGuard();
-  installStyle();
-  updateDebugHud('Starting WebGazer...');
-  collectSentences();
-  watchDomForRefresh();
+function shouldUseMouseFallback(isTopFrame: boolean) {
+  return !isTopFrame || Date.now() - lastPredictionAt > GAZE_STALE_MS;
+}
 
-  const isTopFrame = window.top === window.self;
+function handleCalibrationPoint(x: number, y: number, source: 'top' | 'iframe') {
+  calibrationClicks += 1;
+  const progress = Math.min(calibrationClicks, REQUIRED_CALIBRATION_CLICKS);
+  const progressLine = `Calibration: ${progress}/${REQUIRED_CALIBRATION_CLICKS}`;
 
-  const handleMousePoint = (event: MouseEvent) => {
+  if (!activeWebGazer) {
+    pendingCalibrationPoints.push({ x, y });
+    updateDebugHud(
+      `${progressLine}\nCalibration queued (${source})\nx: ${Math.round(x)} y: ${Math.round(y)}`,
+    );
+    return;
+  }
+
+  activeWebGazer.recordScreenPosition(x, y, 'click');
+
+  if (calibrationClicks === REQUIRED_CALIBRATION_CLICKS) {
+    calibrationCompletedAt = Date.now();
+    updateDebugHud(
+      `${progressLine}\nCalibration clicks complete.\nWaiting for first gaze prediction...`,
+    );
+  } else {
+    updateDebugHud(
+      `${progressLine}\nCalibration click captured (${source})\nx: ${Math.round(x)} y: ${Math.round(y)}`,
+    );
+  }
+}
+
+function toTopViewportPoint(x: number, y: number): WebGazerPoint {
+  let topX = x;
+  let topY = y;
+
+  try {
+    const frame = window.frameElement as HTMLElement | null;
+    if (frame) {
+      const rect = frame.getBoundingClientRect();
+      topX += rect.left;
+      topY += rect.top;
+    }
+  } catch {
+    // Cross-origin iframe access can fail; fall back to local coordinates.
+  }
+
+  return { x: topX, y: topY };
+}
+
+function toLocalViewportPoint(x: number, y: number): WebGazerPoint {
+  let localX = x;
+  let localY = y;
+
+  try {
+    const frame = window.frameElement as HTMLElement | null;
+    if (frame) {
+      const rect = frame.getBoundingClientRect();
+      localX -= rect.left;
+      localY -= rect.top;
+    }
+  } catch {
+    // Cross-origin iframe access can fail; fall back to shared viewport coordinates.
+  }
+
+  return { x: localX, y: localY };
+}
+
+function handleResetShortcut(event: KeyboardEvent, isTopFrame: boolean) {
+  if (!event.shiftKey || (event.key !== 'R' && event.key !== 'r')) {
+    return;
+  }
+
+  event.preventDefault();
+  event.stopPropagation();
+
+  if (isTopFrame) {
+    void resetCalibration(true);
+    return;
+  }
+
+  window.top?.postMessage({ type: CALIBRATION_RESET_MSG_TYPE }, '*');
+}
+
+function installInteractionListeners(isTopFrame: boolean) {
+  const mouseHandler = (event: MouseEvent) => {
     latestMousePoint = { x: event.clientX, y: event.clientY };
 
-    const shouldUseMouseFallback =
-      !isTopFrame || Date.now() - lastPredictionAt > GAZE_STALE_MS;
-    if (!shouldUseMouseFallback) {
+    if (!shouldUseMouseFallback(isTopFrame)) {
       return;
     }
 
@@ -439,93 +511,16 @@ async function startGazeHighlighter() {
     processPoint(latestMousePoint, 'mouse');
   };
 
-  const handleCalibrationPoint = (x: number, y: number, source: 'top' | 'iframe') => {
-    calibrationClicks += 1;
-    const progress = Math.min(calibrationClicks, REQUIRED_CALIBRATION_CLICKS);
-    const progressLine = `Calibration: ${progress}/${REQUIRED_CALIBRATION_CLICKS}`;
-
-    if (!activeWebGazer) {
-      pendingCalibrationPoints.push({ x, y });
-      updateDebugHud(
-        `${progressLine}\nCalibration queued (${source})\nx: ${Math.round(x)} y: ${Math.round(y)}`,
-      );
-      return;
-    }
-
-    activeWebGazer.recordScreenPosition(x, y, 'click');
-
-    if (calibrationClicks === REQUIRED_CALIBRATION_CLICKS) {
-      calibrationCompletedAt = Date.now();
-      updateDebugHud(
-        `${progressLine}\nCalibration clicks complete.\nWaiting for first gaze prediction...`,
-      );
-    } else {
-      updateDebugHud(
-        `${progressLine}\nCalibration click captured (${source})\nx: ${Math.round(x)} y: ${Math.round(y)}`,
-      );
-    }
+  const resetHandler = (event: KeyboardEvent) => {
+    handleResetShortcut(event, isTopFrame);
   };
 
-  const toTopViewportPoint = (x: number, y: number): WebGazerPoint => {
-    let topX = x;
-    let topY = y;
-
-    try {
-      const frame = window.frameElement as HTMLElement | null;
-      if (frame) {
-        const rect = frame.getBoundingClientRect();
-        topX += rect.left;
-        topY += rect.top;
-      }
-    } catch {
-      // Cross-origin iframe access can fail; fall back to local coordinates.
-    }
-
-    return { x: topX, y: topY };
-  };
-
-  const toLocalViewportPoint = (x: number, y: number): WebGazerPoint => {
-    let localX = x;
-    let localY = y;
-
-    try {
-      const frame = window.frameElement as HTMLElement | null;
-      if (frame) {
-        const rect = frame.getBoundingClientRect();
-        localX -= rect.left;
-        localY -= rect.top;
-      }
-    } catch {
-      // Cross-origin iframe access can fail; fall back to shared viewport coordinates.
-    }
-
-    return { x: localX, y: localY };
-  };
-
-  const handleResetShortcut = (event: KeyboardEvent) => {
-    if (!event.shiftKey || (event.key !== 'R' && event.key !== 'r')) {
-      return;
-    }
-
-    event.preventDefault();
-    event.stopPropagation();
-
-    if (isTopFrame) {
-      void resetCalibration(true);
-      return;
-    }
-
-    window.top?.postMessage({ type: CALIBRATION_RESET_MSG_TYPE }, '*');
-  };
-
-  // Listen on both window and document capture phase so iframe-rendered readers
-  // still update the debug cursor consistently.
-  window.addEventListener('mousemove', handleMousePoint, { capture: true });
-  document.addEventListener('mousemove', handleMousePoint, { capture: true });
-  window.addEventListener('keydown', handleResetShortcut, { capture: true });
-  document.addEventListener('keydown', handleResetShortcut, { capture: true });
-  window.addEventListener('keyup', handleResetShortcut, { capture: true });
-  document.addEventListener('keyup', handleResetShortcut, { capture: true });
+  window.addEventListener('mousemove', mouseHandler, { capture: true });
+  document.addEventListener('mousemove', mouseHandler, { capture: true });
+  window.addEventListener('keydown', resetHandler, { capture: true });
+  document.addEventListener('keydown', resetHandler, { capture: true });
+  window.addEventListener('keyup', resetHandler, { capture: true });
+  document.addEventListener('keyup', resetHandler, { capture: true });
   window.addEventListener(
     'click',
     (event) => {
@@ -544,48 +539,48 @@ async function startGazeHighlighter() {
         );
       }
 
-      const shouldUseMouseFallback =
-        !isTopFrame || Date.now() - lastPredictionAt > GAZE_STALE_MS;
-      if (!shouldUseMouseFallback) {
+      if (!shouldUseMouseFallback(isTopFrame)) {
         return;
       }
+
       updateDebugCursor(Math.round(event.clientX), Math.round(event.clientY), 'mouse');
     },
     { capture: true },
   );
+}
 
-  if (!isTopFrame) {
-    window.addEventListener('message', (event: MessageEvent) => {
-      const data = event.data as {
-        type?: string;
-        x?: number;
-        y?: number;
-        direction?: 'next' | 'prev';
-      };
-      if (data?.type === PAGE_TURN_MSG_TYPE) {
-        if (data.direction === 'next' || data.direction === 'prev') {
-          attemptPageTurnLocal(data.direction);
-        }
-        return;
+function installIframeMessageHandlers() {
+  window.addEventListener('message', (event: MessageEvent) => {
+    const data = event.data as {
+      type?: string;
+      x?: number;
+      y?: number;
+      direction?: 'next' | 'prev';
+    };
+    if (data?.type === PAGE_TURN_MSG_TYPE) {
+      if (data.direction === 'next' || data.direction === 'prev') {
+        attemptPageTurnLocal(data.direction);
       }
+      return;
+    }
 
-      if (data?.type !== GAZE_POINT_MSG_TYPE) {
-        return;
-      }
-      if (typeof data.x !== 'number' || typeof data.y !== 'number') {
-        return;
-      }
+    if (data?.type !== GAZE_POINT_MSG_TYPE) {
+      return;
+    }
+    if (typeof data.x !== 'number' || typeof data.y !== 'number') {
+      return;
+    }
 
-      const localPoint = toLocalViewportPoint(data.x, data.y);
-      lastPredictionAt = Date.now();
-      updateDebugCursor(Math.round(localPoint.x), Math.round(localPoint.y), 'gaze');
-      highlightSentenceAtPoint(localPoint.x, localPoint.y);
-    });
+    const localPoint = toLocalViewportPoint(data.x, data.y);
+    lastPredictionAt = Date.now();
+    updateDebugCursor(Math.round(localPoint.x), Math.round(localPoint.y), 'gaze');
+    highlightSentenceAtPoint(localPoint.x, localPoint.y);
+  });
 
-    updateDebugHud('Iframe mode\nmouse fallback active');
-    return;
-  }
+  updateDebugHud('Iframe mode\nmouse fallback active');
+}
 
+function installTopFrameMessageHandlers() {
   window.addEventListener('message', (event: MessageEvent) => {
     const data = event.data as { type?: string; x?: number; y?: number };
     if (!data?.type) {
@@ -606,28 +601,13 @@ async function startGazeHighlighter() {
 
     handleCalibrationPoint(data.x, data.y, 'iframe');
   });
+}
 
-  const webgazer = await initWebGazer();
-  if (!webgazer) {
-    updateDebugHud('WebGazer init failed\nmouse fallback active');
-    return;
-  }
-
-  activeWebGazer = webgazer;
-  await resetCalibration(true);
-
-  if (pendingCalibrationPoints.length > 0) {
-    for (const point of pendingCalibrationPoints.splice(0)) {
-      activeWebGazer.recordScreenPosition(point.x, point.y, 'click');
-    }
-    updateDebugHud('WebGazer ready\nqueued calibration points applied');
-  }
-
-  updateDebugHud('WebGazer ready, waiting for gaze data...');
-
+function startPredictionProbe() {
   if (predictionProbeTimer) {
     window.clearInterval(predictionProbeTimer);
   }
+
   predictionProbeTimer = window.setInterval(async () => {
     maybeEnableAssistMode();
 
@@ -653,13 +633,15 @@ async function startGazeHighlighter() {
       // Ignore probe errors, listener path remains active.
     }
   }, PREDICTION_PROBE_MS);
+}
 
+function installGazeListener(webgazer: WebGazerLike) {
   webgazer.setGazeListener((point) => {
     if (!point) {
       maybeEnableAssistMode();
 
-      const shouldUseMouseFallback = Date.now() - lastPredictionAt > GAZE_STALE_MS;
-      if (import.meta.env.DEV && latestMousePoint && shouldUseMouseFallback) {
+      const shouldFallback = Date.now() - lastPredictionAt > GAZE_STALE_MS;
+      if (import.meta.env.DEV && latestMousePoint && shouldFallback) {
         processPoint(latestMousePoint, 'mouse');
         return;
       }
@@ -681,6 +663,46 @@ async function startGazeHighlighter() {
     disableAssistMode();
     processPoint(point, 'gaze');
   });
+}
+
+async function startGazeHighlighter() {
+  console.log('[WebGazer] content script started');
+  installWebGazerCrashGuard();
+  installStyle();
+  updateDebugHud('Starting WebGazer...');
+  collectSentences();
+  watchDomForRefresh();
+
+  const isTopFrame = window.top === window.self;
+  installInteractionListeners(isTopFrame);
+
+  if (!isTopFrame) {
+    installIframeMessageHandlers();
+    return;
+  }
+
+  installTopFrameMessageHandlers();
+
+  const webgazer = await initWebGazer();
+  if (!webgazer) {
+    updateDebugHud('WebGazer init failed\nmouse fallback active');
+    return;
+  }
+
+  activeWebGazer = webgazer;
+  await resetCalibration(true);
+
+  if (pendingCalibrationPoints.length > 0) {
+    for (const point of pendingCalibrationPoints.splice(0)) {
+      activeWebGazer.recordScreenPosition(point.x, point.y, 'click');
+    }
+    updateDebugHud('WebGazer ready\nqueued calibration points applied');
+  }
+
+  updateDebugHud('WebGazer ready, waiting for gaze data...');
+
+  startPredictionProbe();
+  installGazeListener(webgazer);
 }
 
 function maybeEnableAssistMode() {
