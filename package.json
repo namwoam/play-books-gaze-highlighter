@@ -1,8 +1,10 @@
 {
-  "name": "wxt-starter",
-  "description": "manifest.json description",
+  "name": "play-books-gaze-highlighter",
+  "description": "Auto-highlight Google Play Books sentences using WebGazer eye tracking.",
   "private": true,
   "version": "0.0.0",
+  "author": "An-Che Liang",
+  "license": "MIT",
   "type": "module",
   "scripts": {
     "dev": "wxt",
