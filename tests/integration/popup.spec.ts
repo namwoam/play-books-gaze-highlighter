@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 
 const EXTENSION_DIST = path.resolve(process.cwd(), '.output/chrome-mv3');
+const IS_CI = Boolean(process.env.CI);
 
 test('loads extension popup with expected UI', async () => {
   test.skip(
@@ -16,7 +17,7 @@ test('loads extension popup with expected UI', async () => {
 
   const context = await chromium.launchPersistentContext(userDataDir, {
     channel: 'chromium',
-    headless: false,
+    headless: IS_CI,
     args: [
       `--disable-extensions-except=${EXTENSION_DIST}`,
       `--load-extension=${EXTENSION_DIST}`,
