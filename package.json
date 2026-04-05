@@ -3,6 +3,8 @@
   "description": "manifest.json description",
   "private": true,
   "version": "0.0.0",
+  "author": "An-Che Liang <namwoam@gmail.com>",
+  "license": "MIT",
   "type": "module",
   "scripts": {
     "dev": "wxt",
