@@ -63,7 +63,7 @@ export const FaceMesh: FaceMeshCtor = class FaceMeshWithLocateFile {
       locateFile,
     };
 
-    return new resolvedFaceMesh(finalOptions);
+    return new resolvedFaceMesh(finalOptions) as unknown as FaceMeshWithLocateFile;
   }
 } as unknown as FaceMeshCtor;
 
